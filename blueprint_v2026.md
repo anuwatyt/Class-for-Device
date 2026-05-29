@@ -44,6 +44,8 @@ lib_deps =
   4-20ma/ModbusMaster@^2.0.1
   adafruit/Adafruit GFX Library
   adafruit/Adafruit SSD1306
+  paulstoffregen/OneWire
+  milesburton/DallasTemperature
 ```
 
 Useful commands:
@@ -94,7 +96,7 @@ Preferred pins for general I/O:
 |---:|---|---|---|
 | 4 | yes | yes | Good for relay/output |
 | 13 | yes | yes | General I/O |
-| 14 | yes | yes | General I/O / SPI-capable |
+| 14 | yes | yes | Reserved for DS18B20 1-Wire temperature sensor |
 | 16 | yes | yes | General I/O, often UART2 RX if needed |
 | 17 | yes | yes | General I/O, often UART2 TX if needed |
 | 18 | yes | yes | SPI SCK default |
@@ -142,7 +144,7 @@ Use with caution:
 | 16 | RL2 | Output | Active Low | `DevRelay` |
 | 4 | RL3 | Output | Active Low | `DevRelay` |
 | 12 | AUX1 | Output | Active High | Direct GPIO / relay active-high mode |
-| 14 | AUX2 | Output | Active High | Direct GPIO / relay active-high mode |
+| 14 | DS18B20 | Input/1-Wire | 1-Wire data | `OneWire` + `DallasTemperature` |
 | 15 | AUX3 | Output | Active High | Direct GPIO / relay active-high mode |
 | 25 | AUX4 | Output | Active High | Direct GPIO / relay active-high mode |
 
@@ -166,6 +168,54 @@ libraries:
 ```
 
 If the OLED does not display, scan I2C and check whether the address is `0x3C` or `0x3D`.
+
+## DS18B20 Reference
+
+The board has a DS18B20 temperature sensor connected to GPIO14. Treat GPIO14 as reserved for the 1-Wire temperature bus, not as AUX output, unless the hardware is physically changed.
+
+```yaml
+device: DS18B20
+interface: 1-Wire
+data_pin: GPIO 14
+recommended_pullup: 4.7k ohm from DATA to 3V3
+libraries:
+  - OneWire
+  - DallasTemperature
+```
+
+Basic usage:
+
+```cpp
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define DS18B20_PIN 14
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+void setup() {
+  Serial.begin(9600);
+  ds18b20.begin();
+}
+
+void loop() {
+  ds18b20.requestTemperatures();
+  float tempC = ds18b20.getTempCByIndex(0);
+
+  if (tempC != DEVICE_DISCONNECTED_C) {
+    Serial.printf("DS18B20: %.2f C\n", tempC);
+  }
+
+  delay(1000);
+}
+```
+
+Notes:
+
+- Use a 4.7k pull-up resistor between DATA and 3V3 for stable 1-Wire communication.
+- If multiple DS18B20 sensors are placed on the same bus later, use device addresses instead of only `getTempCByIndex(0)`.
+- Keep DS18B20 reads outside tight Modbus timing windows when possible, especially if the loop also talks over UART0/RS485.
 
 ## Class Contracts
 
@@ -425,12 +475,14 @@ Use these rules whenever an AI assistant modifies or generates code for this pro
 8. Do not use GPIO 34/35/36/39 as outputs.
 9. Avoid GPIO 6-11 entirely.
 10. Be careful with boot strapping pins GPIO 0, 5, 12, and 15.
-11. Read Modbus sensors every 2-3 seconds unless there is a strong reason to change timing.
-12. For PZEM data, check `isDataValid()` before using getters in production logic.
-13. For XY-MD03 data, check the boolean result of `update()` or `isLastReadSuccess()`.
-14. If OLED fails, verify I2C wiring and address before rewriting display code.
-15. Prefer non-blocking timers and `millis()` patterns for new device logic.
-16. Keep files usable as PlatformIO `include/*.h` header files.
+11. Treat GPIO14 as reserved for DS18B20 1-Wire temperature sensing.
+12. Include `OneWire` and `DallasTemperature` when creating code that reads DS18B20.
+13. Read Modbus sensors every 2-3 seconds unless there is a strong reason to change timing.
+14. For PZEM data, check `isDataValid()` before using getters in production logic.
+15. For XY-MD03 data, check the boolean result of `update()` or `isLastReadSuccess()`.
+16. If OLED fails, verify I2C wiring and address before rewriting display code.
+17. Prefer non-blocking timers and `millis()` patterns for new device logic.
+18. Keep files usable as PlatformIO `include/*.h` header files.
 
 ## Typical Main Loop Pattern
 
@@ -441,14 +493,21 @@ Use these rules whenever an AI assistant modifies or generates code for this pro
 #include "DevRelay.h"
 #include "DevXYMDSensor.h"
 #include "DevPZEM.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define DS18B20_PIN 14
 
 DevSwitch sw1(34, false);
 DevIsoInput iso1(33, false);
 DevRelay relay1(17, true);
 DevXYMDSensor xymd(&Serial, 1);
 DevPZEM pzem(&Serial, 0x01);
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
 
 unsigned long lastSensorRead = 0;
+unsigned long lastDs18b20Read = 0;
 
 void setup() {
   Serial.begin(9600);
@@ -459,6 +518,7 @@ void setup() {
 
   xymd.begin(9600);
   pzem.begin();
+  ds18b20.begin();
 }
 
 void loop() {
@@ -482,6 +542,16 @@ void loop() {
 
     if (pzem.update() && pzem.isDataValid()) {
       Serial.println(pzem.toJSON());
+    }
+  }
+
+  if (millis() - lastDs18b20Read >= 1000) {
+    lastDs18b20Read = millis();
+    ds18b20.requestTemperatures();
+    float boardTempC = ds18b20.getTempCByIndex(0);
+
+    if (boardTempC != DEVICE_DISCONNECTED_C) {
+      Serial.printf("DS18B20: %.2f C\n", boardTempC);
     }
   }
 }
@@ -520,12 +590,19 @@ For input/relay issues:
 - Call `update()` every loop for debounce logic.
 - Edge methods are true only for one loop cycle.
 
+For DS18B20 issues:
+
+- Confirm DATA is connected to GPIO14.
+- Confirm 4.7k pull-up from DATA to 3V3.
+- Confirm the sensor has correct power and ground.
+- Check for `DEVICE_DISCONNECTED_C` before trusting temperature values.
+
 ## Future Expansion Ideas
 
 - Add a full PlatformIO project layout with `include/`, `src/`, and `platformio.ini`.
 - Add example sketches for XY-MD03-only, PZEM-only, OLED display, and relay/switch board.
 - Add a unified `main.cpp` demo that can switch between XY-MD03 and PZEM modes.
+- Add a DS18B20 helper class if the board needs filtering, alarms, or multiple sensor addresses.
 - Add MQTT publishing using `toJSON()` from `DevPZEM`.
 - Add NVS logging for PZEM energy snapshots.
 - Add a Modbus bus manager if multiple sensors share UART0.
-
